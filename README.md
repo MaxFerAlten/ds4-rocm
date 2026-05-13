@@ -207,7 +207,7 @@ ROCM run profile:
 DS4_GPU_PROFILE=1 DS4_TOKEN_TIMING=1 DS4_ROCM_WEIGHT_CACHE_ENTRIES=32768 DS4_ROCM_WEIGHT_CACHE_MIN_FREE_MIB=8192 ./ds4 --rocm -m ds4flash.gguf -p "Scrivi una storia su una papera scansafatiche"
 
 
-![[Pasted image 20260513192944.png]]
+![M3 Max t/s](speed-bench/rocm.png)
 
 ## CLI
 
