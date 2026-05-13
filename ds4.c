@@ -71,7 +71,9 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
+    return backend == DS4_BACKEND_METAL ||
+           backend == DS4_BACKEND_CUDA ||
+           backend == DS4_BACKEND_ROCM;
 }
 
 /* =========================================================================
@@ -1424,8 +1426,9 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
 }
 
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
-    if (backend != DS4_BACKEND_CUDA) return true;
+    if (backend != DS4_BACKEND_CUDA && backend != DS4_BACKEND_ROCM) return true;
     if (!m || !m->map || m->size == 0) return false;
+    if (backend == DS4_BACKEND_ROCM) return true;
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return true;
     }
@@ -9085,6 +9088,7 @@ static bool metal_graph_encode_decode_layer(
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
 
     bool ok = true;
+    ds4_gpu_profile_mark("layer_start");
     const bool decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
@@ -9124,6 +9128,7 @@ static bool metal_graph_encode_decode_layer(
                                        layer->hc_attn_base->abs_offset);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_pre");
+    ds4_gpu_profile_mark("attn_hc_pre");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_pre_mixes", g->hc_mix, mix_hc, il, pos);
         metal_graph_debug_dump_tensor("hc_attn_pre_weights", g->hc_pre, DS4_N_HC, il, pos);
@@ -9138,6 +9143,7 @@ static bool metal_graph_encode_decode_layer(
                                                                    layer->attn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("attn_norm");
+    ds4_gpu_profile_mark("attn_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
@@ -9197,6 +9203,7 @@ static bool metal_graph_encode_decode_layer(
                                             false, freq_base, freq_scale, ext_factor, attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("q_path");
+    ds4_gpu_profile_mark("q_path");
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
     }
@@ -9229,6 +9236,7 @@ static bool metal_graph_encode_decode_layer(
      * share one pass without changing the trigonometric path. */
     if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
     DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
+    ds4_gpu_profile_mark("kv_path");
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
@@ -9483,6 +9491,7 @@ static bool metal_graph_encode_decode_layer(
         comp_cache = g->layer_attn_comp_cache[il];
     }
     DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
+    ds4_gpu_profile_mark("compressor_indexer");
 
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
@@ -9530,6 +9539,7 @@ static bool metal_graph_encode_decode_layer(
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
+    ds4_gpu_profile_mark("attention");
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
     }
@@ -9587,6 +9597,7 @@ static bool metal_graph_encode_decode_layer(
                                                         g->heads, 1) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_output");
+    ds4_gpu_profile_mark("attn_output");
     if (ok) {
         metal_graph_debug_dump_tensor("attn_low", g->attn_low, (uint64_t)n_groups * rank, il, pos);
     }
@@ -9601,6 +9612,7 @@ static bool metal_graph_encode_decode_layer(
                                         g->hc_post, g->hc_comb, DS4_N_EMBD, DS4_N_HC) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_post");
+    ds4_gpu_profile_mark("attn_hc_post");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
@@ -9633,6 +9645,7 @@ static bool metal_graph_encode_decode_layer(
                                        layer->hc_ffn_base->abs_offset);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_pre");
+    ds4_gpu_profile_mark("ffn_hc_pre");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
         metal_graph_debug_dump_tensor("hc_ffn_pre_weights", g->hc_pre, DS4_N_HC, il, pos);
@@ -9647,6 +9660,7 @@ static bool metal_graph_encode_decode_layer(
                                                                    layer->ffn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_norm");
+    ds4_gpu_profile_mark("ffn_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
     }
@@ -9668,6 +9682,7 @@ static bool metal_graph_encode_decode_layer(
                                                 layer->ffn_gate_tid2eid != NULL,
                                                 g->router_logits) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("router");
+    ds4_gpu_profile_mark("router");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
@@ -9691,8 +9706,9 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)down_in_dim,
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
-                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm, (int)il) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+    ds4_gpu_profile_mark("routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -9736,6 +9752,7 @@ static bool metal_graph_encode_decode_layer(
         if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up, shared_dim, 0.0f, 1.0f) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
+    ds4_gpu_profile_mark("shared_gate_up");
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
     const bool fuse_shared_down_hc =
         !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
@@ -9760,6 +9777,7 @@ static bool metal_graph_encode_decode_layer(
                                           g->shared_mid, 1) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+    ds4_gpu_profile_mark("shared_down");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
     }
@@ -9791,6 +9809,7 @@ static bool metal_graph_encode_decode_layer(
                                                   DS4_N_HC) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
+    ds4_gpu_profile_mark("ffn_hc_post");
 #undef DS4_METAL_PROFILE_DECODE_STAGE
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
@@ -10643,6 +10662,7 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
 
+    ds4_gpu_profile_mark("token_start");
     bool ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
                                               model->map,
                                               model->size,
@@ -10651,6 +10671,7 @@ static bool metal_graph_encode_token_raw_swa(
                                               (uint32_t)token,
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
+    ds4_gpu_profile_mark("embed_done");
 
     /*
      * Start executing the prefix of the decode graph while the CPU is still
@@ -10685,9 +10706,11 @@ static bool metal_graph_encode_token_raw_swa(
             ok = ds4_gpu_flush_commands() != 0;
         }
     }
+    ds4_gpu_profile_mark("layers_done");
 
     if (ok && need_logits) {
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        ds4_gpu_profile_mark("output_done");
     }
     return ok;
 }
@@ -12447,6 +12470,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    DS4_SWIGLU_CLAMP_EXP,
                                                    g->batch_ffn_norm,
                                                    n_tokens,
+                                                   (int)il,
                                                    &g->batch_routed_mid_is_f16) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
@@ -15366,6 +15390,8 @@ static int generate_metal_graph_raw_swa(
 #endif
 
 #ifdef DS4_NO_GPU
+void ds4_gpu_profile_mark(const char *label) { (void)label; }
+
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size) {
     (void)backend;
     ds4_context_memory m = {0};
@@ -15412,6 +15438,7 @@ const char *ds4_backend_name(ds4_backend backend) {
     switch (backend) {
     case DS4_BACKEND_METAL: return "metal";
     case DS4_BACKEND_CUDA:  return "cuda";
+    case DS4_BACKEND_ROCM:  return "rocm";
     case DS4_BACKEND_CPU:   return "cpu";
     }
     return "unknown";
@@ -17001,6 +17028,21 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         return 1;
 #endif
     }
+    if (e->backend == DS4_BACKEND_ROCM) {
+#ifdef __APPLE__
+        fprintf(stderr, "ds4: ROCm backend requested but this build is linked with Metal\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+#else
+#ifndef DS4_USE_ROCM
+        fprintf(stderr, "ds4: ROCm backend requested but this build is linked with CUDA, not ROCm\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+#endif
+#endif
+    }
     if (e->backend == DS4_BACKEND_METAL) {
 #ifndef __APPLE__
         fprintf(stderr, "ds4: Metal backend requested but this build is linked with CUDA, not Metal\n");
@@ -17009,6 +17051,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         return 1;
 #endif
     }
+#ifdef DS4_USE_ROCM
+    if (e->backend == DS4_BACKEND_CUDA) {
+#ifndef __APPLE__
+        fprintf(stderr, "ds4: CUDA backend requested but this build is linked with ROCm, not CUDA\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+#endif
+    }
+#endif
     if (graph_backend) {
         e->metal_ready = ds4_gpu_init() != 0;
         if (!e->metal_ready) {

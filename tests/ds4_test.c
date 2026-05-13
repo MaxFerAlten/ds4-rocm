@@ -4,6 +4,12 @@
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
+#ifdef DS4_USE_ROCM
+int ds4_rocm_test_weight_cache(void);
+int ds4_rocm_test_weight_cache_dynamic_capacity(void);
+int ds4_rocm_test_moe_prewarm_layer(void);
+int ds4_rocm_test_moe_prewarm_env(void);
+#endif
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -13,17 +19,23 @@ static const char *test_model_path(void) {
     return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
 }
 
+static ds4_backend test_graph_backend(void) {
+#ifdef DS4_USE_ROCM
+    return DS4_BACKEND_ROCM;
+#elif defined(__APPLE__)
+    return DS4_BACKEND_METAL;
+#else
+    return DS4_BACKEND_CUDA;
+#endif
+}
+
 static ds4_engine *test_get_engine(bool quality) {
     ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
     if (*slot) return *slot;
 
     ds4_engine_options opt = {
         .model_path = test_model_path(),
-#ifdef __APPLE__
-        .backend = DS4_BACKEND_METAL,
-#else
-        .backend = DS4_BACKEND_CUDA,
-#endif
+        .backend = test_graph_backend(),
         .quality = quality,
     };
     TEST_ASSERT(ds4_engine_open(slot, &opt) == 0);
@@ -148,6 +160,150 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(out);
     free(weights_raw);
+}
+
+/* =========================================================================
+ * GPU tensor smoke test (Task 6).
+ * Allocates 4096 bytes, writes deterministic bytes, copies device-to-device,
+ * reads back, and compares exactly.
+ * =========================================================================
+ */
+static void test_gpu_tensor_smoke(void) {
+    const uint64_t N = 4096;
+    uint8_t *host_src = (uint8_t *)malloc(N);
+    uint8_t *host_dst = (uint8_t *)malloc(N);
+    TEST_ASSERT(host_src != NULL);
+    TEST_ASSERT(host_dst != NULL);
+    if (!host_src || !host_dst) { free(host_src); free(host_dst); return; }
+
+    for (uint64_t i = 0; i < N; i++) host_src[i] = (uint8_t)((i * 37u + 13u) & 0xffu);
+    memset(host_dst, 0, N);
+
+    ds4_gpu_tensor *a = ds4_gpu_tensor_alloc(N);
+    ds4_gpu_tensor *b = ds4_gpu_tensor_alloc(N);
+    TEST_ASSERT(a != NULL);
+    TEST_ASSERT(b != NULL);
+    if (!a || !b) { ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); free(host_src); free(host_dst); return; }
+
+    TEST_ASSERT(ds4_gpu_tensor_bytes(a) == N);
+    TEST_ASSERT(ds4_gpu_tensor_bytes(b) == N);
+
+    /* write host -> device a */
+    TEST_ASSERT(ds4_gpu_tensor_write(a, 0, host_src, N) != 0);
+    /* copy device a -> device b */
+    TEST_ASSERT(ds4_gpu_tensor_copy(b, 0, a, 0, N) != 0);
+    /* read device b -> host */
+    TEST_ASSERT(ds4_gpu_tensor_read(b, 0, host_dst, N) != 0);
+
+    /* compare */
+    int mismatch = 0;
+    for (uint64_t i = 0; i < N; i++) {
+        if (host_dst[i] != host_src[i]) { mismatch++; break; }
+    }
+    TEST_ASSERT(mismatch == 0);
+
+    ds4_gpu_tensor_free(a);
+    ds4_gpu_tensor_free(b);
+    free(host_src);
+    free(host_dst);
+}
+
+/* =========================================================================
+ * GPU kernel numeric tests (Tasks 7-10).
+ * Covers add, SwiGLU, repeat-HC, RMSNorm, matmul F16 (already tested above
+ * via test_metal_f16_matvec_fast_nr0_4).  Extended by later tasks.
+ * =========================================================================
+ */
+
+static float test_rms_norm_ref(const float *x, uint32_t n, float eps) {
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n; i++) sum += x[i] * x[i];
+    return 1.0f / sqrtf(sum / (float)n + eps);
+}
+
+static void test_gpu_kernels(void) {
+    const uint32_t N = 256;
+
+    /* --- add_tensor --- */
+    {
+        float *ha = (float *)malloc(N * sizeof(float));
+        float *hb = (float *)malloc(N * sizeof(float));
+        float *hout = (float *)malloc(N * sizeof(float));
+        TEST_ASSERT(ha && hb && hout);
+        for (uint32_t i = 0; i < N; i++) { ha[i] = (float)i * 0.01f; hb[i] = (float)(N - i) * 0.01f; }
+        ds4_gpu_tensor *ta = ds4_gpu_tensor_alloc(N * sizeof(float));
+        ds4_gpu_tensor *tb = ds4_gpu_tensor_alloc(N * sizeof(float));
+        ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(N * sizeof(float));
+        TEST_ASSERT(ta && tb && tout);
+        TEST_ASSERT(ds4_gpu_tensor_write(ta, 0, ha, N * sizeof(float)));
+        TEST_ASSERT(ds4_gpu_tensor_write(tb, 0, hb, N * sizeof(float)));
+        TEST_ASSERT(ds4_gpu_add_tensor(tout, ta, tb, N));
+        TEST_ASSERT(ds4_gpu_tensor_read(tout, 0, hout, N * sizeof(float)));
+        float max_err = 0.0f;
+        for (uint32_t i = 0; i < N; i++) {
+            float ref = ha[i] + hb[i];
+            float err = fabsf(hout[i] - ref);
+            if (err > max_err) max_err = err;
+        }
+        TEST_ASSERT(max_err < 1e-5f);
+        ds4_gpu_tensor_free(ta); ds4_gpu_tensor_free(tb); ds4_gpu_tensor_free(tout);
+        free(ha); free(hb); free(hout);
+    }
+
+    /* --- swiglu_tensor --- */
+    {
+        float *hgate = (float *)malloc(N * sizeof(float));
+        float *hup   = (float *)malloc(N * sizeof(float));
+        float *hout  = (float *)malloc(N * sizeof(float));
+        TEST_ASSERT(hgate && hup && hout);
+        for (uint32_t i = 0; i < N; i++) {
+            hgate[i] = (float)((int)(i % 17u) - 8) * 0.25f;
+            hup[i]   = (float)((int)(i % 13u) - 6) * 0.25f;
+        }
+        ds4_gpu_tensor *tgate = ds4_gpu_tensor_alloc(N * sizeof(float));
+        ds4_gpu_tensor *tup   = ds4_gpu_tensor_alloc(N * sizeof(float));
+        ds4_gpu_tensor *tout  = ds4_gpu_tensor_alloc(N * sizeof(float));
+        TEST_ASSERT(tgate && tup && tout);
+        TEST_ASSERT(ds4_gpu_tensor_write(tgate, 0, hgate, N * sizeof(float)));
+        TEST_ASSERT(ds4_gpu_tensor_write(tup,   0, hup,   N * sizeof(float)));
+        TEST_ASSERT(ds4_gpu_swiglu_tensor(tout, tgate, tup, N, 0.0f, 1.0f));
+        TEST_ASSERT(ds4_gpu_tensor_read(tout, 0, hout, N * sizeof(float)));
+        float max_err = 0.0f;
+        for (uint32_t i = 0; i < N; i++) {
+            float g = hgate[i];
+            float ref = g / (1.0f + expf(-g)) * hup[i];
+            float err = fabsf(hout[i] - ref);
+            if (err > max_err) max_err = err;
+        }
+        TEST_ASSERT(max_err < 1e-5f);
+        ds4_gpu_tensor_free(tgate); ds4_gpu_tensor_free(tup); ds4_gpu_tensor_free(tout);
+        free(hgate); free(hup); free(hout);
+    }
+
+    /* --- rms_norm_plain_tensor --- */
+    {
+        float *hx   = (float *)malloc(N * sizeof(float));
+        float *hout = (float *)malloc(N * sizeof(float));
+        TEST_ASSERT(hx && hout);
+        for (uint32_t i = 0; i < N; i++) hx[i] = (float)((int)(i % 23u) - 11) * 0.1f;
+        ds4_gpu_tensor *tx   = ds4_gpu_tensor_alloc(N * sizeof(float));
+        ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(N * sizeof(float));
+        TEST_ASSERT(tx && tout);
+        TEST_ASSERT(ds4_gpu_tensor_write(tx, 0, hx, N * sizeof(float)));
+        const float eps = 1e-6f;
+        TEST_ASSERT(ds4_gpu_rms_norm_plain_tensor(tout, tx, N, eps));
+        TEST_ASSERT(ds4_gpu_tensor_read(tout, 0, hout, N * sizeof(float)));
+        float scale = test_rms_norm_ref(hx, N, eps);
+        float max_err = 0.0f;
+        for (uint32_t i = 0; i < N; i++) {
+            float ref = hx[i] * scale;
+            float err = fabsf(hout[i] - ref);
+            if (err > max_err) max_err = err;
+        }
+        TEST_ASSERT(max_err < 1e-4f);
+        ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(tout);
+        free(hx); free(hout);
+    }
 }
 
 static char *test_read_file(const char *path) {
@@ -568,6 +724,15 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+#if defined(DS4_USE_ROCM) && !defined(DS4_NO_GPU)
+static void test_rocm_weight_cache_group(void) {
+    TEST_ASSERT(ds4_rocm_test_weight_cache());
+    TEST_ASSERT(ds4_rocm_test_weight_cache_dynamic_capacity());
+    TEST_ASSERT(ds4_rocm_test_moe_prewarm_layer());
+    TEST_ASSERT(ds4_rocm_test_moe_prewarm_env());
+}
+#endif
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -583,6 +748,11 @@ static const ds4_test_entry test_entries[] = {
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
+    {"--gpu-tensor-smoke", "gpu-tensor-smoke", "GPU tensor alloc/write/copy/read smoke test", test_gpu_tensor_smoke},
+    {"--gpu-kernels", "gpu-kernels", "GPU kernel numeric regressions (add, swiglu, rmsnorm)", test_gpu_kernels},
+#ifdef DS4_USE_ROCM
+    {"--rocm-weight-cache", "rocm-weight-cache", "ROCm weight cache unit tests", test_rocm_weight_cache_group},
+#endif
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };

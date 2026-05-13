@@ -1,4 +1,6 @@
-# DwarfStar 4
+# DwarfStar 4 Rocm version
+
+
 
 DrawfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
@@ -139,6 +141,12 @@ make                  # macOS Metal
 make cuda-spark       # Linux CUDA, DGX Spark / GB10
 make cuda-generic     # Linux CUDA, other local CUDA GPUs
 make cpu              # CPU-only diagnostics build
+
+ROCM:
+
+ make clean
+ make ROCM=1 ROCMARCH=gfx1151 ds4 ds4-server ds4-bench ds4test
+
 ```
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
@@ -193,6 +201,13 @@ Use `--step-incr N` for different linear spacing, or `--step-mul F` for
 exponential sweeps. Output is CSV with one row per frontier: latest prefill
 interval tokens/sec, generation tokens/sec at that frontier, and
 `kvcache_bytes`.
+
+ROCM run profile:
+
+DS4_GPU_PROFILE=1 DS4_TOKEN_TIMING=1 DS4_ROCM_WEIGHT_CACHE_ENTRIES=32768 DS4_ROCM_WEIGHT_CACHE_MIN_FREE_MIB=8192 ./ds4 --rocm -m ds4flash.gguf -p "Scrivi una storia su una papera scansafatiche"
+
+
+![[Pasted image 20260513192944.png]]
 
 ## CLI
 

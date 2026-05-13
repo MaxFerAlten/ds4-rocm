@@ -34,6 +34,7 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+void ds4_gpu_profile_mark(const char *label);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
@@ -638,7 +639,8 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x);
+        const ds4_gpu_tensor *x,
+        int                     layer_id);
 
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
@@ -666,6 +668,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         float                   clamp,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
+        int                     layer_id,
         bool                   *mid_is_f16);
 
 /* =========================================================================

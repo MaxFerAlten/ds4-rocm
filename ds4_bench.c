@@ -63,7 +63,7 @@ static void usage(FILE *fp) {
         "\n"
         "Model and backend:\n"
         "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
+        "  --metal | --cuda | --rocm | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
@@ -113,9 +113,10 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 static ds4_backend parse_backend(const char *s, const char *opt) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+    if (!strcmp(s, "rocm")) return DS4_BACKEND_ROCM;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
-    fprintf(stderr, "ds4-bench: valid backends are: metal, cuda, cpu\n");
+    fprintf(stderr, "ds4-bench: valid backends are: metal, cuda, rocm, cpu\n");
     exit(2);
 }
 
@@ -124,6 +125,8 @@ static ds4_backend default_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_USE_ROCM)
+    return DS4_BACKEND_ROCM;
 #else
     return DS4_BACKEND_CUDA;
 #endif
@@ -215,6 +218,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--rocm")) {
+            c.backend = DS4_BACKEND_ROCM;
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {

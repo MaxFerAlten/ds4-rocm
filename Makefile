@@ -27,7 +27,16 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+ROCM ?= 0
+HIPCC ?= /opt/rocm/bin/hipcc
+ROCM_ARCH ?= gfx1151
+HIPFLAGS ?= -O3 -ffast-math --offload-arch=$(ROCM_ARCH) -std=c++17 -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+ifeq ($(ROCM),1)
+CFLAGS += -DDS4_USE_ROCM
+CORE_OBJS = ds4.o ds4_rocm.o
+else
 CORE_OBJS = ds4.o ds4_cuda.o
+endif
 CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
@@ -87,13 +96,25 @@ cuda:
 	$(MAKE) ds4 ds4-server ds4-bench CUDA_ARCH="$(CUDA_ARCH)"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
+ifeq ($(ROCM),1)
+	$(HIPCC) $(HIPFLAGS) -o $@ $^ $(LDLIBS)
+else
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+endif
 
 ds4-server: ds4_server.o rax.o $(CORE_OBJS)
+ifeq ($(ROCM),1)
+	$(HIPCC) $(HIPFLAGS) -o $@ $^ $(LDLIBS)
+else
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+endif
 
 ds4-bench: ds4_bench.o $(CORE_OBJS)
+ifeq ($(ROCM),1)
+	$(HIPCC) $(HIPFLAGS) -o $@ $^ $(LDLIBS)
+else
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+endif
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -146,12 +167,19 @@ ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
+ROCM_KERNELS := $(wildcard rocm/kernels/*.hip)
+
+ds4_rocm.o: rocm/ds4_rocm.cpp rocm/ds4_rocm_common.h $(ROCM_KERNELS) ds4_gpu.h ds4.h
+	$(HIPCC) $(HIPFLAGS) -DDS4_USE_ROCM -c -o $@ rocm/ds4_rocm.cpp
+
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_test: ds4_test.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+else ifeq ($(ROCM),1)
+	$(HIPCC) $(HIPFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(LDLIBS)
 else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
